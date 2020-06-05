@@ -8,14 +8,12 @@ import com.linkedin.metadata.dao.AspectKey;
 import com.linkedin.metadata.dao.BaseLocalDAO;
 import com.linkedin.metadata.dao.utils.ModelUtils;
 import com.linkedin.parseq.Task;
-import com.linkedin.restli.common.ComplexResourceKey;
-import com.linkedin.restli.common.EmptyRecord;
 import com.linkedin.restli.server.annotations.Action;
 import com.linkedin.restli.server.annotations.ActionParam;
 import com.linkedin.restli.server.annotations.Optional;
 import com.linkedin.restli.server.annotations.QueryParam;
 import com.linkedin.restli.server.annotations.RestMethod;
-import com.linkedin.restli.server.resources.ComplexKeyResourceTaskTemplate;
+import com.linkedin.restli.server.resources.CollectionResourceTaskTemplate;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -33,37 +31,40 @@ import static com.linkedin.metadata.restli.RestliConstants.*;
 
 
 /**
- * A base class for the entity rest.li resource, that supports CRUD methods.
+ * A base class for the entity rest.li resource where the key is of a primitive (simple) type.
  *
  * See http://go/gma for more details
  *
- * @param <KEY> the resource's key type
+ * @param <KEY> the resource's simple key type
  * @param <VALUE> the resource's value type
  * @param <URN> must be a valid {@link Urn} type for the snapshot
  * @param <SNAPSHOT> must be a valid snapshot type defined in com.linkedin.metadata.snapshot
  * @param <ASPECT_UNION> must be a valid aspect union type supported by the snapshot
  */
-public abstract class BaseEntityResource<
+public abstract class BaseEntitySimpleKeyResource<
     // @formatter:off
-    KEY extends RecordTemplate,
+    KEY,
     VALUE extends RecordTemplate,
     URN extends Urn,
     SNAPSHOT extends RecordTemplate,
     ASPECT_UNION extends UnionTemplate>
     // @formatter:on
-    extends ComplexKeyResourceTaskTemplate<KEY, EmptyRecord, VALUE> {
+    extends CollectionResourceTaskTemplate<KEY, VALUE> {
 
   private static final BaseRestliAuditor DUMMY_AUDITOR = new DummyRestliAuditor(Clock.systemUTC());
 
-  private final Class<SNAPSHOT> _snapshotClass;
   private final Class<ASPECT_UNION> _aspectUnionClass;
+  private final Class<SNAPSHOT> _snapshotClass;
   private final Set<Class<? extends RecordTemplate>> _supportedAspectClasses;
 
-  public BaseEntityResource(@Nonnull Class<SNAPSHOT> snapshotClass, @Nonnull Class<ASPECT_UNION> aspectUnionClass) {
+  public BaseEntitySimpleKeyResource(
+      @Nonnull Class<ASPECT_UNION> aspectUnionClass,
+      @Nonnull Class<SNAPSHOT> snapshotClass) {
+
     super();
     ModelUtils.validateSnapshotAspect(snapshotClass, aspectUnionClass);
-    _snapshotClass = snapshotClass;
     _aspectUnionClass = aspectUnionClass;
+    _snapshotClass = snapshotClass;
     _supportedAspectClasses = ModelUtils.getValidAspectTypes(_aspectUnionClass);
   }
 
@@ -94,12 +95,6 @@ public abstract class BaseEntityResource<
   protected abstract URN toUrn(@Nonnull KEY key);
 
   /**
-   * Converts a URN to resource's key.
-   */
-  @Nonnull
-  protected abstract KEY toKey(@Nonnull URN urn);
-
-  /**
    * Converts a snapshot to resource's value.
    */
   @Nonnull
@@ -112,16 +107,21 @@ public abstract class BaseEntityResource<
   protected abstract SNAPSHOT toSnapshot(@Nonnull VALUE value, @Nonnull URN urn);
 
   /**
-   * Retrieves the value for an entity that is made up of latest versions of specified aspects.
+   * Gets the value for an entity that is made up of latest versions of specified aspects.
+   * If the aspects are not specified, the entity contains the latest versions of all aspects for that entity.
+   *
+   * @param id the lookup key
+   * @param aspectNames input aspect names.
    */
   @RestMethod.Get
   @Nonnull
-  public Task<VALUE> get(@Nonnull ComplexResourceKey<KEY, EmptyRecord> id,
+  public Task<VALUE> get(
+      @Nonnull KEY id,
       @QueryParam(PARAM_ASPECTS) @Optional("[]") @Nonnull String[] aspectNames) {
 
     return RestliUtils.toTask(() -> {
-      final URN urn = toUrn(id.getKey());
-      final VALUE value = getInternalNonEmpty(Collections.singleton(urn), parseAspectsParam(aspectNames)).get(urn);
+      final URN urn = toUrn(id);
+      final VALUE value = getUrnEntityMap(Collections.singleton(urn), parseAspectsParam(aspectNames)).get(urn);
       if (value == null) {
         throw RestliUtils.resourceNotFoundException();
       }
@@ -130,20 +130,26 @@ public abstract class BaseEntityResource<
   }
 
   /**
-   * Similar to {@link #get(ComplexResourceKey, String[])} but for multiple entities.
+   * Gets the value for an entity that is made up of latest versions of specified aspects.
    */
   @RestMethod.BatchGet
   @Nonnull
-  public Task<Map<ComplexResourceKey<KEY, EmptyRecord>, VALUE>> batchGet(
-      @Nonnull Set<ComplexResourceKey<KEY, EmptyRecord>> ids,
+  public Task<Map<KEY, VALUE>> batchGet(
+      @Nonnull Set<KEY> ids,
       @QueryParam(PARAM_ASPECTS) @Optional("[]") @Nonnull String[] aspectNames) {
+
     return RestliUtils.toTask(() -> {
-      final Map<ComplexResourceKey<KEY, EmptyRecord>, URN> urnMap =
-          ids.stream().collect(Collectors.toMap(Function.identity(), id -> toUrn(id.getKey())));
-      return getInternal(urnMap.values(), parseAspectsParam(aspectNames)).entrySet()
+      final Map<URN, KEY> urnIdMap = ids.stream()
+          .collect(Collectors.toMap(
+              this::toUrn,
+              Function.identity()));
+
+      return getUrnEntityMap(urnIdMap.keySet(), parseAspectsParam(aspectNames))
+          .entrySet()
           .stream()
-          .collect(
-              Collectors.toMap(e -> new ComplexResourceKey<>(toKey(e.getKey()), new EmptyRecord()), e -> e.getValue()));
+          .collect(Collectors.toMap(
+              entry -> urnIdMap.get(entry.getKey()),
+              Map.Entry::getValue));
     });
   }
 
@@ -153,19 +159,12 @@ public abstract class BaseEntityResource<
   @Action(name = ACTION_INGEST)
   @Nonnull
   public Task<Void> ingest(@ActionParam(PARAM_SNAPSHOT) @Nonnull SNAPSHOT snapshot) {
-    return ingestInternal(snapshot, Collections.emptySet());
-  }
-
-  @Nonnull
-  protected Task<Void> ingestInternal(@Nonnull SNAPSHOT snapshot,
-      @Nonnull Set<Class<? extends RecordTemplate>> aspectsToIgnore) {
     return RestliUtils.toTask(() -> {
+      @SuppressWarnings("unchecked")
       final URN urn = (URN) ModelUtils.getUrnFromSnapshot(snapshot);
       final AuditStamp auditStamp = getAuditor().requestAuditStamp(getContext().getRawRequestContext());
-      ModelUtils.getAspectsFromSnapshot(snapshot).stream().forEach(aspect -> {
-        if (!aspectsToIgnore.contains(aspect.getClass())) {
-          getLocalDAO().add(urn, aspect, auditStamp);
-        }
+      ModelUtils.getAspectsFromSnapshot(snapshot).forEach(metadata -> {
+        getLocalDAO().add(urn, metadata, auditStamp);
       });
       return null;
     });
@@ -176,7 +175,8 @@ public abstract class BaseEntityResource<
    */
   @Action(name = ACTION_GET_SNAPSHOT)
   @Nonnull
-  public Task<SNAPSHOT> getSnapshot(@ActionParam(PARAM_URN) @Nonnull String urnString,
+  public Task<SNAPSHOT> getSnapshot(
+      @ActionParam(PARAM_URN) @Nonnull String urnString,
       @ActionParam(PARAM_ASPECTS) @Optional("[]") @Nonnull String[] aspectNames) {
 
     return RestliUtils.toTask(() -> {
@@ -185,7 +185,10 @@ public abstract class BaseEntityResource<
           .map(aspectClass -> new AspectKey<>(aspectClass, urn, LATEST_VERSION))
           .collect(Collectors.toSet());
 
-      final List<UnionTemplate> aspects = getLocalDAO().get(keys)
+      final Map<AspectKey<URN, ? extends RecordTemplate>, java.util.Optional<? extends RecordTemplate>> keyAspectMap =
+          getLocalDAO().get(keys);
+
+      final List<UnionTemplate> aspects = keyAspectMap
           .values()
           .stream()
           .filter(java.util.Optional::isPresent)
@@ -206,12 +209,11 @@ public abstract class BaseEntityResource<
 
     return RestliUtils.toTask(() -> {
       final URN urn = parseUrnParam(urnString);
-      final List<String> backfilledAspects = parseAspectsParam(aspectNames).stream()
+      return parseAspectsParam(aspectNames).stream()
           .map(aspectClass -> getLocalDAO().backfill(aspectClass, urn))
-          .filter(optionalAspect -> optionalAspect.isPresent())
+          .filter(java.util.Optional::isPresent)
           .map(optionalAspect -> ModelUtils.getAspectName(optionalAspect.get().getClass()))
-          .collect(Collectors.toList());
-      return backfilledAspects.toArray(new String[0]);
+          .toArray(String[]::new);
     });
   }
 
@@ -220,7 +222,9 @@ public abstract class BaseEntityResource<
     if (aspectNames.length == 0) {
       return _supportedAspectClasses;
     }
-    return Arrays.asList(aspectNames).stream().map(ModelUtils::getAspectClass).collect(Collectors.toSet());
+    return Arrays.stream(aspectNames)
+        .map(ModelUtils::getAspectClass)
+        .collect(Collectors.toSet());
   }
 
   /**
@@ -231,27 +235,21 @@ public abstract class BaseEntityResource<
    * @return All {@link VALUE} objects keyed by {@link URN} obtained from DB
    */
   @Nonnull
-  protected Map<URN, VALUE> getInternal(@Nonnull Collection<URN> urns,
+  protected Map<URN, VALUE> getUrnEntityMap(
+      @Nonnull Collection<URN> urns,
       @Nonnull Set<Class<? extends RecordTemplate>> aspectClasses) {
-    return getUrnAspectMap(urns, aspectClasses).entrySet()
-        .stream()
-        .collect(Collectors.toMap(Map.Entry::getKey, e -> toValue(newSnapshot(e.getKey(), e.getValue()))));
-  }
 
-  /**
-   * Similar to {@link #getInternal(Collection, Set)} but filter out {@link URN}s which are not in the DB.
-   */
-  @Nonnull
-  protected Map<URN, VALUE> getInternalNonEmpty(@Nonnull Collection<URN> urns,
-      @Nonnull Set<Class<? extends RecordTemplate>> aspectClasses) {
     return getUrnAspectMap(urns, aspectClasses).entrySet()
         .stream()
         .filter(e -> !e.getValue().isEmpty())
-        .collect(Collectors.toMap(Map.Entry::getKey, e -> toValue(newSnapshot(e.getKey(), e.getValue()))));
+        .collect(Collectors.toMap(
+            Map.Entry::getKey,
+            entity -> toValue(newSnapshot(entity.getKey(), entity.getValue()))));
   }
 
   @Nonnull
-  private Map<URN, List<UnionTemplate>> getUrnAspectMap(@Nonnull Collection<URN> urns,
+  private Map<URN, List<UnionTemplate>> getUrnAspectMap(
+      @Nonnull Collection<URN> urns,
       @Nonnull Set<Class<? extends RecordTemplate>> aspectClasses) {
     // Construct the keys to retrieve latest version of all supported aspects for all URNs.
     final Set<AspectKey<URN, ? extends RecordTemplate>> keys = urns.stream()
@@ -261,8 +259,11 @@ public abstract class BaseEntityResource<
         .flatMap(List::stream)
         .collect(Collectors.toSet());
 
-    final Map<URN, List<UnionTemplate>> urnAspectsMap =
-        urns.stream().collect(Collectors.toMap(Function.identity(), urn -> new ArrayList<>()));
+    final Map<URN, List<UnionTemplate>> urnAspectsMap = urns
+        .stream()
+        .collect(Collectors.toMap(
+            Function.identity(),
+            urn -> new ArrayList<>()));
 
     getLocalDAO().get(keys)
         .forEach((key, aspect) -> aspect.ifPresent(
